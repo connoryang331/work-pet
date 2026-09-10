@@ -26,6 +26,17 @@ const APP_BRAND = 'TraeWork';
 const DAEMON_VERSION = '1.0.3';
 const APP_VERSION = DAEMON_VERSION;
 const HOST = '127.0.0.1';
+
+// 语义化版本比较：a>b 返回正数，a<b 返回负数，相等返回 0（支持 v 前缀，忽略 -beta 等后缀）
+function compareSemver(a, b) {
+  const pa = String(a).trim().replace(/^v/i, '').split('-')[0].split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).trim().replace(/^v/i, '').split('-')[0].split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
 const CDP_PORT = 9222;
 const UI_PORT = parseInt(process.env.TRAEWORK_UI_PORT || '47921', 10);
 const CDP_STARTUP_TIMEOUT_MS = 60000;
@@ -2628,7 +2639,8 @@ const server = http.createServer(async (req, res) => {
         if (gh.status === 200 && gh.body) {
           const latestTag = String(gh.body.tag_name || '').trim();
           const currentTag = 'v' + APP_VERSION;
-          const hasUpdate = Boolean(latestTag && latestTag !== currentTag);
+          // 仅当远端版本严格大于当前版本时才提示更新，避免本地 dev 版领先于已发布版本时误报
+          const hasUpdate = Boolean(latestTag && compareSemver(latestTag, currentTag) > 0);
           return sendJson(res, 200, {
             ok: true,
             hasUpdate,

@@ -7,7 +7,9 @@ license = "MIT"
 
 [lib]
 name = "workpet_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# 仅桌面端（Windows exe + NSIS）：去掉 cdylib——MinGW 工具链链接 cdylib 时
+# 导出符号超限（export ordinal too large > 65535），且项目无移动端打包需求
+crate-type = ["staticlib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
