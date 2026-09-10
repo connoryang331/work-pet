@@ -53,7 +53,8 @@ pub fn do_request(method: &str, path: &str, body: Option<&str>) -> ApiResult {
     // ureq 3.4：ConfigBuilder 设置每请求总超时（switch 会重启 TraeWork，给足时间）
     let mut cb = ureq::Agent::config_builder();
     cb = cb.timeout_connect(Some(Duration::from_secs(4)));
-    let per_call = if path.starts_with("/api/accounts/switch") {
+    let per_call = if path.starts_with("/api/accounts/switch") || path.starts_with("/api/client/ca/switch") {
+        // 切换 CodeArts 账号需停/重启客户端再写 vscdb，给足时间
         Duration::from_secs(40)
     } else {
         Duration::from_secs(12)

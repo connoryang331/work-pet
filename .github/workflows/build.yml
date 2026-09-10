@@ -15,7 +15,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22+：daemon 的 CodeArts Agent 账号切换依赖内置 node:sqlite（读写 state.vscdb）
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
 

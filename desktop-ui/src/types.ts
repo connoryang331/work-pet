@@ -55,6 +55,7 @@ export interface ClientAccount {
   nickname: string;
   phone?: string;
   tokenExpiresAt?: number; // ms
+  sessionExpiresAt?: number; // ms（CodeArts 会话临时凭证有效期，约 1h，客户端运行期间自动续）
   checkin?: ClientCheckin | string | null;
 }
 

@@ -1,8 +1,8 @@
 [package]
 name = "workpet"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
-description = "Work Pet · TraeWork + WorkBuddy + CodeBuddy 联合签到宠物"
+description = "Work Pet · 多 AI Agent 签到与账号管理宠物"
 license = "MIT"
 
 [lib]

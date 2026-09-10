@@ -95,10 +95,10 @@ export const backupAccount = () => call<any>("POST", "/api/accounts/backup");
 
 export interface BackupExportResult {
   file: string;
-  counts: { traework: number; workbuddy: number; codebuddy: number };
+  counts: { traework: number; workbuddy: number; codebuddy: number; autoclaw: number; codearts: number };
 }
 
-/// 导出三端全部账号到一个 WorkPet-accounts-<时间戳>.json（存于 WorkPet 数据目录）
+/// 导出各端全部账号到一个 WorkPet-accounts-<时间戳>.json（存于 WorkPet 数据目录）
 export function exportAllAccounts(): Promise<BackupExportResult> {
   return call<any>("POST", "/api/backup/export").then((v) => ({
     file: String(v?.file ?? ""),
@@ -106,6 +106,8 @@ export function exportAllAccounts(): Promise<BackupExportResult> {
       traework: Number(v?.counts?.traework ?? 0),
       workbuddy: Number(v?.counts?.workbuddy ?? 0),
       codebuddy: Number(v?.counts?.codebuddy ?? 0),
+      autoclaw: Number(v?.counts?.autoclaw ?? 0),
+      codearts: Number(v?.counts?.codearts ?? 0),
     },
   }));
 }
@@ -118,11 +120,13 @@ export function listBackupFiles(): Promise<string[]> {
 
 export function importBackup(
   data: unknown
-): Promise<{ traework: number; workbuddy: number; codebuddy: number }> {
+): Promise<{ traework: number; workbuddy: number; codebuddy: number; autoclaw: number; codearts: number }> {
   return call<any>("POST", "/api/backup/import", { data }).then((v) => ({
     traework: Number(v?.counts?.traework ?? 0),
     workbuddy: Number(v?.counts?.workbuddy ?? 0),
     codebuddy: Number(v?.counts?.codebuddy ?? 0),
+    autoclaw: Number(v?.counts?.autoclaw ?? 0),
+    codearts: Number(v?.counts?.codearts ?? 0),
   }));
 }
 
@@ -194,6 +198,8 @@ export interface PetConfig {
   cbLaunchOnStart: boolean;
   /// 打开 Pet 时同时启动 AutoClaw（默认 false）
   acLaunchOnStart: boolean;
+  /// 打开 Pet 时同时启动 CodeArts Agent（默认 false）
+  caLaunchOnStart: boolean;
   /// 隐藏桌面宠物（隐藏后收起面板即整窗隐藏到托盘）
   hidePet: boolean;
   /// 主 Tab 是否显示文字（默认隐藏，仅图标）
@@ -210,6 +216,7 @@ export function getConfig(): Promise<PetConfig> {
     fontScale: Number(v?.fontScale ?? 1),
     cbLaunchOnStart: Boolean(v?.cbLaunchOnStart),
     acLaunchOnStart: Boolean(v?.acLaunchOnStart),
+    caLaunchOnStart: Boolean(v?.caLaunchOnStart),
     hidePet: Boolean(v?.hidePet),
     tabShowText: Boolean(v?.tabShowText),
     tabOrder: Array.isArray(v?.tabOrder) ? v.tabOrder.map(String) : [],
@@ -224,6 +231,7 @@ export function saveConfig(patch: Partial<PetConfig>): Promise<PetConfig> {
     fontScale: Number(v?.fontScale ?? 1),
     cbLaunchOnStart: Boolean(v?.cbLaunchOnStart),
     acLaunchOnStart: Boolean(v?.acLaunchOnStart),
+    caLaunchOnStart: Boolean(v?.caLaunchOnStart),
     hidePet: Boolean(v?.hidePet),
     tabShowText: Boolean(v?.tabShowText),
     tabOrder: Array.isArray(v?.tabOrder) ? v.tabOrder.map(String) : [],
@@ -283,7 +291,12 @@ export function fmtExpiry(ts: string | null | undefined): string {
 
 // ---------------- WorkBuddy / CodeBuddy（WorkPet daemon 原生支持） ----------------
 
-export type ClientKind = "wb" | "cb" | "ac";
+export type ClientKind = "wb" | "cb" | "ac" | "ca";
+
+/// 拉起 CodeArts Agent 客户端（force=true 时重启以加载新切换的登录态）
+export function launchCodearts(force = false): Promise<void> {
+  return invoke<void>("launch_codearts", { force });
+}
 
 /// 以 CDP 模式拉起 CodeBuddy 客户端
 export function launchCodeBuddy(force = false): Promise<void> {
@@ -310,6 +323,7 @@ export function clientAccounts(kind: ClientKind): Promise<{
           nickname: String(a.nickname ?? ""),
           phone: String(a.phone ?? ""),
           tokenExpiresAt: a.tokenExpiresAt ?? undefined,
+          sessionExpiresAt: a.sessionExpiresAt ?? undefined,
           checkin: a.checkin ?? null,
         }))
       : [],

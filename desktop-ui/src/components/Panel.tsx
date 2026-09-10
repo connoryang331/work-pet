@@ -20,11 +20,13 @@ import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { getConfig, saveConfig, exportAllAccounts, importBackup } from "@/api";
 import WorkBuddyTab from "@/components/WorkBuddyTab";
+import CodeArtsTab from "@/components/CodeArtsTab";
 import SharedAccountCard, { toExpireSec } from "@/components/AccountCardShared";
 import traeworkIcon from "@/assets/traework.png";
 import workbuddyIcon from "@/assets/workbuddy.png";
 import codebuddyIcon from "@/assets/codebuddy.png";
 import autoclawIcon from "@/assets/autoclaw.png";
+import codeartsIcon from "@/assets/codearts.png";
 import rewardQR from "@/assets/buy-me-token.png";
 import type { Account, Entitlement, Status, UpdateInfo } from "@/types";
 import { fmtCredits } from "@/api";
@@ -56,12 +58,13 @@ interface PanelProps {
   updateInfo?: UpdateInfo | null;
 }
 
-type Tab = "tw" | "wb" | "cb" | "ac" | "settings" | "about";
+type Tab = "tw" | "wb" | "cb" | "ac" | "ca" | "settings" | "about";
 
 const MAIN_TABS: { key: Tab; label: string; img: string }[] = [
   { key: "wb", label: "WorkBuddy", img: workbuddyIcon },
   { key: "cb", label: "CodeBuddy", img: codebuddyIcon },
   { key: "ac", label: "AutoClaw", img: autoclawIcon },
+  { key: "ca", label: "CodeArts", img: codeartsIcon },
   { key: "tw", label: "TraeWork", img: traeworkIcon },
 ];
 const ICON_TABS: { key: Tab; label: string; icon: typeof User }[] = [
@@ -71,12 +74,13 @@ const ICON_TABS: { key: Tab; label: string; icon: typeof User }[] = [
 
 export default function Panel(p: PanelProps) {
   const [tab, setTab] = useState<Tab>("wb");
-  const [tabOrder, setTabOrder] = useState<Tab[]>(["wb", "cb", "ac", "tw"]);
+  const [tabOrder, setTabOrder] = useState<Tab[]>(["wb", "cb", "ac", "ca", "tw"]);
   const dragTabRef = useRef<Tab | null>(null);
   const tabWheelLockRef = useRef(0);
   const [fontScale, setFontScale] = useState<number>(1);
   const [cbLaunch, setCbLaunch] = useState<boolean>(false);
   const [acLaunch, setAcLaunch] = useState<boolean>(false);
+  const [caLaunch, setCaLaunch] = useState<boolean>(false);
   const [hidePetState, setHidePetState] = useState<boolean | null>(null);
   const [wbRefreshTick, setWbRefreshTick] = useState(0); // 100% 基准 = 原 115% 渲染大小
   // 标题栏拖动窗口（与宠物卡片拖动同款逻辑）
@@ -101,8 +105,9 @@ export default function Panel(p: PanelProps) {
       setFontScale(c.fontScale || 1);
       setCbLaunch(c.cbLaunchOnStart);
       setAcLaunch(c.acLaunchOnStart);
+      setCaLaunch(c.caLaunchOnStart);
       setHidePetState(c.hidePet);
-      const known: Tab[] = ["tw", "wb", "cb", "ac"];
+      const known: Tab[] = ["tw", "wb", "cb", "ac", "ca"];
       const mapped = (c.tabOrder ?? []).map((t) => (t === "accounts" ? "tw" : t));
       const arr = mapped.filter((t): t is Tab => known.includes(t as Tab));
       const uniq = Array.from(new Set(arr));
@@ -139,7 +144,7 @@ export default function Panel(p: PanelProps) {
     dragTabRef.current = null;
     if (!from || from === target) return;
     setTabOrder((prev) => {
-      const known: Tab[] = ["tw", "wb", "cb", "ac"];
+      const known: Tab[] = ["tw", "wb", "cb", "ac", "ca"];
       const head = prev.filter((t) => known.includes(t));
       const arr = head.concat(known.filter((t) => !head.includes(t)));
       const fromIdx = arr.indexOf(from);
@@ -322,6 +327,13 @@ export default function Panel(p: PanelProps) {
               onLaunch={(force) => invoke("launch_autoclaw", { force: force ?? false }).then(() => undefined)}
             />
           </div>
+          <div className={cn("min-h-0 flex-1 flex-col", tab === "ca" ? "flex" : "hidden")}>
+            <CodeArtsTab
+              showPhone={!!showPhone}
+              refreshTick={wbRefreshTick}
+              active={tab === "ca"}
+            />
+          </div>
           {tab === "tw" && <AccountsTab p={p} checked={checked} />}
           {tab === "settings" && (
             <SettingsTab
@@ -335,6 +347,8 @@ export default function Panel(p: PanelProps) {
               onCbLaunchChange={setCbLaunch}
               acLaunch={acLaunch}
               onAcLaunchChange={setAcLaunch}
+              caLaunch={caLaunch}
+              onCaLaunchChange={setCaLaunch}
               hidePet={p.hidePet}
               hidePetState={hidePetState}
               onHidePetChange={(v) => {
@@ -551,7 +565,7 @@ function BackupRestoreCard({ onRestored }: { onRestored?: () => void }) {
             exportAllAccounts()
               .then((r) => {
                 setMsg(
-                  `已导出 ${r.file}（Trae ${r.counts.traework} / WB ${r.counts.workbuddy} / CB ${r.counts.codebuddy}）`
+                  `已导出 ${r.file}（Trae ${r.counts.traework} / WB ${r.counts.workbuddy} / CB ${r.counts.codebuddy} / AC ${r.counts.autoclaw} / CA ${r.counts.codearts}）`
                 );
                 onRestored?.();
               })
@@ -588,7 +602,7 @@ function BackupRestoreCard({ onRestored }: { onRestored?: () => void }) {
               const text = await f.text();
               const data = JSON.parse(text);
               const c = await importBackup(data);
-              setMsg(`已恢复：Trae ${c.traework} / WB ${c.workbuddy} / CB ${c.codebuddy} 个账号`);
+              setMsg(`已恢复：Trae ${c.traework} / WB ${c.workbuddy} / CB ${c.codebuddy} / AC ${c.autoclaw} / CA ${c.codearts} 个账号`);
               onRestored?.();
             } catch (err) {
               setMsg(`恢复失败：${String(err).slice(0, 60)}`);
@@ -619,6 +633,8 @@ function SettingsTab({
   onCbLaunchChange,
   acLaunch,
   onAcLaunchChange,
+  caLaunch,
+  onCaLaunchChange,
   hidePet,
   hidePetState,
   onHidePetChange,
@@ -634,6 +650,8 @@ function SettingsTab({
   onCbLaunchChange: (v: boolean) => void;
   acLaunch: boolean;
   onAcLaunchChange: (v: boolean) => void;
+  caLaunch: boolean;
+  onCaLaunchChange: (v: boolean) => void;
   hidePet: boolean;
   hidePetState: boolean | null;
   onHidePetChange: (v: boolean) => void;
@@ -689,6 +707,12 @@ function SettingsTab({
     const next = !acLaunch;
     onAcLaunchChange(next);
     saveConfig({ acLaunchOnStart: next }).catch(() => onAcLaunchChange(!next));
+  };
+
+  const toggleCaLaunch = () => {
+    const next = !caLaunch;
+    onCaLaunchChange(next);
+    saveConfig({ caLaunchOnStart: next }).catch(() => onCaLaunchChange(!next));
   };
 
   const toggleAutoStart = () => {
@@ -836,6 +860,21 @@ function SettingsTab({
         />
       </div>
 
+      {/* 设置：打开 Pet 时启动 CodeArts Agent */}
+      <div className="flex items-center gap-3 rounded-xl bg-muted/60 px-3 py-2.5">
+        <div className="flex min-w-0 flex-col">
+          <span className="text-xs font-medium">打开 Pet 时同时启动 CodeArts Agent</span>
+          <span className="text-[10px] text-muted-foreground">
+            拉起 CodeArts Agent 客户端（切换账号时会自动重启它）
+          </span>
+        </div>
+        <Switch
+          checked={caLaunch}
+          onCheckedChange={toggleCaLaunch}
+          className="ml-auto shrink-0"
+        />
+      </div>
+
       {/* 设置：打开 Pet 时启动 TraeWork */}
       <div className="flex items-center gap-3 rounded-xl bg-muted/60 px-3 py-2.5">
         <div className="flex min-w-0 flex-col">
@@ -921,9 +960,10 @@ function AboutTab({ updateInfo }: { updateInfo?: UpdateInfo | null }) {
         )}
 
         <p className="max-w-full px-2 text-[11px] leading-4 text-foreground/80">
-          Work Pet 是多 AI Agent（WorkBuddy、CodeBuddy、TraeWork）签到宠物：打开即自动为全部账号签到；
-          多账号集中管理与一键切换；积分条按到期时间归类，到期一目了然。账号与配置全部留在本机。
-          本机回环 CDP 注入 · 不改官方安装包。
+          Work Pet 是多 AI Agent（WorkBuddy、CodeBuddy、TraeWork、AutoClaw、CodeArts Agent）签到与账号管理宠物：
+          打开即自动为全部账号签到；多账号集中管理与一键切换；积分条按到期时间归类，到期一目了然。
+          CodeArts Agent 无需签到（额度按官方政策自动发放），支持多账号登录态一键切换。
+          账号与配置全部留在本机。本机回环 CDP 注入 · 不改官方安装包。
         </p>
 
         <a

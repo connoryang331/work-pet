@@ -20,5 +20,6 @@ desktop-ui/.vite/
 # ===== 调试/临时文件 =====
 *.bak
 .dbg-*
+.temp/
 debug-claim.js
 client-checkin-cache.json

@@ -226,6 +226,69 @@ async fn launch_autoclaw(force: Option<bool>) -> Result<(), String> {
     Err("仅支持 Windows".to_string())
 }
 
+/// 拉起 CodeArts Agent（华为云 CodeArts IDE 客户端）。
+/// CodeArts 无需 CDP 注入：切换账号由 daemon 直接写 vscdb 后重启客户端，
+/// 因此已运行且未要求 force 时直接返回，不折腾运行中的窗口。
+#[tauri::command]
+async fn launch_codearts(force: Option<bool>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(v) = std::env::var("WORKPET_CODEARTS_BIN") {
+            candidates.push(PathBuf::from(v));
+        }
+        for (env, sub) in [
+            ("ProgramFiles", r"CodeArts Agent\codearts-agent.exe"),
+            ("ProgramFiles(x86)", r"CodeArts Agent\codearts-agent.exe"),
+            ("LOCALAPPDATA", r"Programs\CodeArts Agent\codearts-agent.exe"),
+        ] {
+            if let Ok(v) = std::env::var(env) {
+                candidates.push(Path::new(&v).join(sub));
+            }
+        }
+        candidates.push(PathBuf::from(r"D:\Program Files\CodeArts Agent\codearts-agent.exe"));
+        let exe = candidates.into_iter().find(|c| c.is_file()).ok_or("未找到 codearts-agent.exe")?;
+
+        let running = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq codearts-agent.exe", "/FO", "CSV"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("codearts-agent.exe"))
+            .unwrap_or(false);
+        if running && !force.unwrap_or(false) {
+            return Ok(());
+        }
+        if running {
+            // 优雅关闭再拉起：切换账号后需重启客户端才会读到新登录态
+            let _ = std::process::Command::new("taskkill")
+                .args(["/IM", "codearts-agent.exe"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            let still = std::process::Command::new("tasklist")
+                .args(["/FI", "IMAGENAME eq codearts-agent.exe", "/FO", "CSV"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("codearts-agent.exe"))
+                .unwrap_or(false);
+            if still {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/IM", "codearts-agent.exe", "/F", "/T"])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output();
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        }
+        std::process::Command::new(&exe)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("启动 CodeArts Agent 失败: {e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    Err("仅支持 Windows".to_string())
+}
+
 /// 查询 daemon 自举是否完成（前端启动时轮询，避免错过一次性事件）。
 #[tauri::command]
 fn daemon_ready(state: tauri::State<BootstrapState>) -> Option<Result<(), String>> {
@@ -622,6 +685,7 @@ pub fn run() {
             launch_codebuddy,
             launch_codebuddy_cli,
             launch_autoclaw,
+            launch_codearts,
             daemon_ready,
             set_panel_open,
             set_window_visible,

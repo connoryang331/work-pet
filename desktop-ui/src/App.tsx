@@ -211,14 +211,12 @@ export default function App() {
     [armed, arm, refreshAll, showBubble]
   );
 
-  // 备份所有账号：三端账号统一导出到 WorkPet-accounts-<时间戳>.json
+  // 备份所有账号：各端账号统一导出到 WorkPet-accounts-<时间戳>.json
   const doBackup = useCallback(async () => {
     try {
       const r = await exportAllAccounts();
-      showBubble(
-        `已备份 ${r.counts.traework + r.counts.workbuddy + r.counts.codebuddy} 个账号 → ${r.file}`,
-        4000
-      );
+      const n = r.counts.traework + r.counts.workbuddy + r.counts.codebuddy + r.counts.autoclaw + r.counts.codearts;
+      showBubble(`已备份 ${n} 个账号 → ${r.file}`, 4000);
     } catch (e) {
       showBubble(`备份失败：${String(e).slice(0, 80)}`, 4000);
     }
@@ -310,13 +308,16 @@ export default function App() {
     if (bootstrap !== "ready") return;
   }, [bootstrap]);
 
-  // 就绪后按设置决定是否同时启动 WorkBuddy 客户端
+  // 就绪后按设置决定是否同时启动 WorkBuddy / CodeArts / CodeArts Agent 客户端
   useEffect(() => {
     if (bootstrap !== "ready") return;
     getConfig()
       .then((c) => {
         if (c.cbLaunchOnStart) {
           void launchCodeBuddy().catch(() => {});
+        }
+        if (c.caLaunchOnStart) {
+          void invoke("launch_codearts", { force: false }).catch(() => {});
         }
         if (!c.wbLaunchOnStart) return;
         return invoke("launch_workbuddy").catch(() => {});

@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 
 const APP_BRAND = 'TraeWork';
-const DAEMON_VERSION = '1.0.2';
+const DAEMON_VERSION = '1.0.3';
 const APP_VERSION = DAEMON_VERSION;
 const HOST = '127.0.0.1';
 const CDP_PORT = 9222;
@@ -158,6 +158,7 @@ function loadStore() {
     workbuddy: Object.assign({ current: null, accounts: [] }, st.workbuddy),
     codebuddy: Object.assign({ current: null, accounts: [] }, st.codebuddy),
     ac: Object.assign({ current: null, accounts: [] }, st.ac),
+    codearts: Object.assign({ current: null, accounts: [] }, st.codearts),
   };
 }
 function saveStore(store) {
@@ -451,12 +452,12 @@ async function checkinRequest(action, auth) {
 // ---------------- 设置（持久化到数据目录 config.json） ----------------
 const CONFIG_DIR = DATA_ROOT;
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const SETTING_DEFAULTS = { launchHostOnStart: false, wbLaunchOnStart: false, cbLaunchOnStart: false, acLaunchOnStart: false, showPhone: false, fontScale: 1, tabOrder: ['wb', 'cb', 'ac', 'tw'], tabShowText: false, hidePet: true };
+const SETTING_DEFAULTS = { launchHostOnStart: false, wbLaunchOnStart: false, cbLaunchOnStart: false, acLaunchOnStart: false, caLaunchOnStart: false, showPhone: false, fontScale: 1, tabOrder: ['wb', 'cb', 'ac', 'ca', 'tw'], tabShowText: false, hidePet: true };
 // 旧配置兼容：TraeWork Tab 的 key 原为 'accounts'，v1.0.2 起统一为 'tw'
 function normalizeTabOrder(v) {
   if (!Array.isArray(v)) return null;
   const mapped = v.map((t) => (t === 'accounts' ? 'tw' : String(t)));
-  const known = ['wb', 'cb', 'ac', 'tw'];
+  const known = ['wb', 'cb', 'ac', 'ca', 'tw'];
   const uniq = Array.from(new Set(mapped)).filter((t) => known.includes(t));
   return uniq.length === known.length ? uniq : null;
 }
@@ -654,6 +655,10 @@ function collectExportAccounts() {
       current: clientReadAuth('ac'),
       accounts: (store.ac && store.ac.accounts) || [],
     },
+    codearts: {
+      current: (store.codearts && store.codearts.current) || null, // 保持已有 current，不因导出而清空
+      accounts: (store.codearts && store.codearts.accounts) || [],
+    },
   };
   // 把引擎目录的最新账号状态同步回单文件账号库，保证 WorkPet-accounts.json 始终完整
   store.traework.currentSecret = out.traework.currentSecret;
@@ -661,6 +666,7 @@ function collectExportAccounts() {
   store.workbuddy = { current: out.workbuddy.current, accounts: out.workbuddy.accounts };
   store.codebuddy = { current: out.codebuddy.current, accounts: out.codebuddy.accounts };
   store.ac = { current: out.autoclaw.current, accounts: out.autoclaw.accounts };
+  store.codearts = { current: out.codearts.current, accounts: out.codearts.accounts };
   saveStore(store);
   return out;
 }
@@ -684,6 +690,7 @@ function exportBackupFile() {
       workbuddy: data.workbuddy.accounts.length,
       codebuddy: data.codebuddy.accounts.length,
       autoclaw: (data.autoclaw.accounts || []).length,
+      codearts: (data.codearts.accounts || []).length,
     },
   };
 }
@@ -699,7 +706,7 @@ function listBackupFiles() {
 
 async function restoreBackupData(data) {
   if (!data || data.app !== 'WorkPet') throw new Error('不是有效的 WorkPet 备份文件');
-  const counts = { traework: 0, workbuddy: 0, codebuddy: 0, autoclaw: 0 };
+  const counts = { traework: 0, workbuddy: 0, codebuddy: 0, autoclaw: 0, codearts: 0 };
   const atomicWrite = (file, content) => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = file + '.tmp';
@@ -756,6 +763,18 @@ async function restoreBackupData(data) {
       counts.autoclaw = (counts.autoclaw || 0) + 1;
     }
   }
+  // CodeArts Agent：仅并入账号库（不回写 vscdb —— 切换时优先用本机可解的 secretRaw，
+  // 跨机备份则用 secretPlain 以本机 safeStorage key 重加密，见 caSwitchToAccount）
+  if (data.codearts) {
+    for (const a of data.codearts.accounts || []) {
+      const uid = a && a.uid;
+      if (!uid || (!a.secretRaw && !a.secretPlain)) continue;
+      const idx = store.codearts.accounts.findIndex((x) => x && String(x.uid) === String(uid));
+      if (idx >= 0) store.codearts.accounts[idx] = Object.assign({}, store.codearts.accounts[idx], a, { backedUpAt: Date.now() });
+      else store.codearts.accounts.push(Object.assign({ backedUpAt: Date.now() }, a));
+      counts.codearts = (counts.codearts || 0) + 1;
+    }
+  }
   saveStore(store);
   return counts;
 }
@@ -783,6 +802,45 @@ const AC_API_HOST = 'https://autoglm-acceleration-api.zhipuai.cn';
 const AC_APP_ID = '100003';
 const AC_APP_KEY = '38d2391985e2369a5fb8227d8e6cd5e5';
 
+// ---------------- CodeArts Agent（华为云 CodeArts IDE 客户端，独立账号体系） ----------------
+// 无签到：额度按官方政策自动发放（不写死任何数字）。WorkPet 只做「多账号登录态管理 + 一键切换」。
+// 登录态 = VSCode 系数据目录 User/globalStorage/state.vscdb（SQLite ItemTable）里的两个键：
+//   1) secret://{"extensionId":"huaweicloud.authentication","key":"HuaweiCloudSession"}
+//      值为 {"type":"Buffer","data":[...]} 包装的 Electron safeStorage v10 密文
+//      （DPAPI 包裹 AES-256-GCM，key 在数据目录 Local State 的 os_crypt.encrypted_key，与 AutoClaw 同构），
+//      明文含 refresh_token（长期）+ 临时 IAM 凭证 expires_at（约 1h，客户端运行期间自动续）；
+//   2) huaweicloud.codearts-snap 键内含 userInfoKey（账号 id / 华为账号用户名 / 临时凭证快照）。
+// 切换 = 停客户端（IDE 会持有/回写 vscdb）→ 备份库密文写回 vscdb（同机原样写回；跨机导入的备份
+//   用 secretPlain 以本机 key 重加密）→ 同步内核侧 .codeartsdoer 的 userInfo.json → 按需重启客户端。
+const CA_SECRET_KEY_DEFAULT = 'secret://{"extensionId":"huaweicloud.authentication","key":"HuaweiCloudSession"}';
+const CA_SNAP_KEY = 'huaweicloud.codearts-snap';
+const CA_IDE_EXE = 'codearts-agent.exe';
+function detectCodeArtsDataDir() {
+  const roam = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  if (process.env.WORKPET_CODEARTS_DIR) {
+    const d = process.env.WORKPET_CODEARTS_DIR;
+    if (fs.existsSync(path.join(d, 'User', 'globalStorage', 'state.vscdb'))) return d;
+  }
+  let names = [];
+  try { names = fs.readdirSync(roam).filter((n) => /^codearts[-_ ]?agent$/i.test(n)); } catch (_) {}
+  for (const n of names) {
+    const d = path.join(roam, n);
+    if (fs.existsSync(path.join(d, 'User', 'globalStorage', 'state.vscdb'))) return d;
+  }
+  return null;
+}
+const CA_DATA_DIR = detectCodeArtsDataDir();
+const CA_VSCDB = CA_DATA_DIR ? path.join(CA_DATA_DIR, 'User', 'globalStorage', 'state.vscdb') : null;
+const CA_LOCAL_STATE = CA_DATA_DIR ? path.join(CA_DATA_DIR, 'Local State') : null;
+// CodeArts Agent（Doer 内核）侧的用户身份文件：切换账号时一并换回，保持内核会话一致
+const CA_DOER_USERINFO = path.join(os.homedir(), '.codeartsdoer', 'codearts-data', 'storage', 'userInfo.json');
+const CA_EXE_CANDIDATES = (process.env.WORKPET_CODEARTS_BIN ? [process.env.WORKPET_CODEARTS_BIN] : []).concat([
+  'D:/Program Files/CodeArts Agent/' + CA_IDE_EXE,
+  path.join(process.env.ProgramFiles || 'C:/Program Files', 'CodeArts Agent', CA_IDE_EXE),
+  path.join(process.env['ProgramFiles(x86)'] || 'C:/Program Files (x86)', 'CodeArts Agent', CA_IDE_EXE),
+  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Programs', 'CodeArts Agent', CA_IDE_EXE),
+]);
+
 const CLIENT_PROFILES = {
   wb: {
     id: 'wb', name: 'WorkBuddy',
@@ -804,6 +862,13 @@ const CLIENT_PROFILES = {
     apiHost: AC_API_HOST,
     checkinHosts: [AC_API_HOST],
     cdpPort: 9226,
+  },
+  ca: {
+    id: 'ca', name: 'CodeArts Agent',
+    authFile: CA_VSCDB, // 仅作路径展示用；ca 登录态在 SQLite 里，读写全部走专用函数
+    apiHost: '',
+    checkinHosts: [],
+    cdpPort: 9228,
   },
 };
 
@@ -1051,11 +1116,314 @@ function acSyncStoreAfterRefresh(accessToken, refreshToken, jwtExp) {
   } catch (_) {}
 }
 
+// ---------------- CodeArts Agent 登录态（safeStorage 解密 + state.vscdb 读写） ----------------
+// 与 AutoClaw 同构的 Electron safeStorage v10：DPAPI 解 Local State 的 key，再 AES-256-GCM 解密。
+// CodeArts 有自己独立的 Local State，key 缓存与 AC 分开维护。
+
+const CA_KEY_PENDING = Symbol('ca-key-pending');
+let caKeyCache = null;    // 已解出的 CodeArts AES-256 key
+let caKeyPromise = null;  // 进行中的异步解密（并发共享）
+
+/** 获取 CodeArts safeStorage AES key：只解一次并缓存；复用 AC 的 DPAPI 实现（入参即密文） */
+function caRequestKey() {
+  if (caKeyCache) return Promise.resolve(caKeyCache);
+  if (!caKeyPromise) {
+    caKeyPromise = (async () => {
+      const ls = readJsonOrNull(CA_LOCAL_STATE);
+      const enc = ls && ls.os_crypt && ls.os_crypt.encrypted_key;
+      if (!enc) throw new Error('CodeArts Local State 无 os_crypt.encrypted_key');
+      const raw = Buffer.from(enc, 'base64');
+      if (raw.slice(0, 5).toString() !== 'DPAPI') return raw;
+      const viaNative = acDpapiNative(raw.slice(5));
+      if (viaNative) return viaNative;
+      return await acDpapiViaPowershell(raw.slice(5));
+    })().then((k) => { caKeyCache = k; caKeyPromise = null; return k; })
+      .catch((e) => { caKeyPromise = null; throw e; });
+  }
+  return caKeyPromise;
+}
+
+/** 后台预热（daemon 启动时调用，静默失败） */
+function caWarmKey() {
+  if (!CA_VSCDB) return;
+  caRequestKey().catch((e) => log('[client:ca] AES key 预取失败: ' + e.message));
+}
+
+/** node:sqlite 惰性加载（需 Node 22+；缺失时给出明确错误而不是崩溃） */
+let CaSqliteModule = undefined; // undefined=未探测 / null=不可用
+function caSqlite() {
+  if (CaSqliteModule !== undefined) return CaSqliteModule;
+  try { CaSqliteModule = require('node:sqlite'); }
+  catch (_) { CaSqliteModule = null; }
+  return CaSqliteModule;
+}
+
+/** 打开 vscdb（读路径优先只读；readOnly 选项在不支持的 Node 版本上自动降级） */
+function caOpenDb(file, readOnly) {
+  const sqlite = caSqlite();
+  if (!sqlite) throw new Error('当前 Node 运行时无 node:sqlite（切换 CodeArts 账号需 Node 22+）');
+  if (readOnly) {
+    try { return new sqlite.DatabaseSync(file, { readOnly: true }); } catch (_) {}
+  }
+  return new sqlite.DatabaseSync(file);
+}
+
+/**
+ * 读取 state.vscdb 里的两个登录键（只读，带重试：客户端运行期间可能瞬时持锁）。
+ * 返回 { secretKey, secretRaw, snapState }；无数据目录/无登录返回 null；不可用返回 { error }。
+ */
+function caReadDb(retries) {
+  if (!CA_VSCDB || !fs.existsSync(CA_VSCDB)) return null;
+  if (!caSqlite()) return { error: '当前 Node 运行时无 node:sqlite（需 Node 22+，请更新 Work Pet 安装包）' };
+  const n = retries || 3;
+  for (let i = 0; i < n; i++) {
+    let db = null;
+    try {
+      db = caOpenDb(CA_VSCDB, true);
+      const srow = db.prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'secret://%' AND key LIKE '%HuaweiCloudSession%'").get();
+      const snapRow = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get(CA_SNAP_KEY);
+      return {
+        secretKey: srow ? String(srow.key) : CA_SECRET_KEY_DEFAULT,
+        secretRaw: srow ? String(srow.value) : null,
+        snapState: snapRow ? String(snapRow.value) : null,
+      };
+    } catch (e) {
+      if (i >= n - 1) return { error: '读取 CodeArts 登录库失败: ' + e.message };
+    } finally {
+      try { if (db) db.close(); } catch (_) {}
+    }
+  }
+  return null;
+}
+
+/** 解密 vscdb 的 secret 值（{"type":"Buffer","data":[...]} → v10 → AES-256-GCM → 明文 JSON 字符串） */
+function caDecryptVscSecret(vscValue, key) {
+  const s = String(vscValue || '');
+  let bytes;
+  if (s.startsWith('{"type":"Buffer"')) bytes = Buffer.from(JSON.parse(s).data);
+  else bytes = Buffer.from(s, 'latin1'); // 兼容旧形态
+  if (bytes.slice(0, 3).toString('latin1') !== 'v10') throw new Error('非 safeStorage v10 格式');
+  const nonce = bytes.slice(3, 15), ct = bytes.slice(15);
+  const tag = ct.slice(ct.length - 16), body = ct.slice(0, ct.length - 16);
+  const dec = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+  dec.setAuthTag(tag);
+  return Buffer.concat([dec.update(body), dec.final()]).toString('utf8');
+}
+
+/** 用本机 key 把明文会话 JSON 重新加密成 vscdb 的 secret 值（跨机器恢复用） */
+function caEncryptVscSecret(plain, key) {
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+  const ct = Buffer.concat([cipher.update(Buffer.from(plain, 'utf8')), cipher.final()]);
+  const bytes = Buffer.concat([Buffer.from('v10', 'latin1'), nonce, ct, cipher.getAuthTag()]);
+  return JSON.stringify({ type: 'Buffer', data: Array.from(bytes) });
+}
+
+/** 读取并解密当前登录态 → { uid, nickname, sessionExp, refreshTokenExp, secretRaw, secretPlain, snapState, userInfoJson } */
+async function caReadAuthAsync() {
+  const dbv = caReadDb();
+  if (!dbv || dbv.error) return dbv && dbv.error ? { error: dbv.error } : null;
+  if (!dbv.secretRaw) return null; // 从未登录过
+  const key = await caRequestKey();
+  const secretPlain = caDecryptVscSecret(dbv.secretRaw, key); // 解密失败会抛出（key 不匹配/数据损坏）
+  let j = null;
+  try { j = JSON.parse(secretPlain); } catch (e) { throw new Error('会话明文解析失败: ' + e.message); }
+  let snap = null;
+  try { snap = dbv.snapState ? JSON.parse(dbv.snapState) : null; } catch (_) {}
+  const info = (snap && snap.userInfoKey) || {};
+  const uid = String((j.account && j.account.id) || info.id || '');
+  if (!uid) return null;
+  const nickname = String((j.account && j.account.label) || info.name || uid);
+  return {
+    uid, nickname,
+    sessionExp: j.expires_at ? Date.parse(j.expires_at) : null,
+    refreshTokenExp: acJwtExpMs(j.refresh_token || ''),
+    secretRaw: dbv.secretRaw,
+    secretPlain,
+    snapState: dbv.snapState || null,
+    userInfoJson: (() => { try { return fs.readFileSync(CA_DOER_USERINFO, 'utf8'); } catch (_) { return null; } })(),
+  };
+}
+
+/** 把当前登录同步进账号库 codearts 段（登录库变化时调用；仅在内容变化时落盘） */
+let caSwitching = false; // 切换过程中挂起同步，防止读到中间态
+async function caSyncStore() {
+  if (caSwitching || !CA_VSCDB) return null;
+  const a = await caReadAuthAsync();
+  if (!a || a.error || !a.uid) return a || null;
+  const store = loadStore();
+  const rec = {
+    uid: a.uid,
+    nickname: a.nickname,
+    sessionExpiresAt: a.sessionExp,
+    tokenExpiresAt: a.refreshTokenExp || a.sessionExp, // 卡片「Cookie 时限」= refresh_token 有效期
+    secretRaw: a.secretRaw,
+    secretPlain: a.secretPlain,
+    snapState: a.snapState,
+    userInfoJson: a.userInfoJson,
+    backedUpAt: Date.now(),
+  };
+  const idx = store.codearts.accounts.findIndex((x) => x && String(x.uid) === String(a.uid));
+  const prev = idx >= 0 ? store.codearts.accounts[idx] : null;
+  const changed = !prev
+    || prev.secretRaw !== rec.secretRaw || prev.snapState !== rec.snapState
+    || prev.nickname !== rec.nickname || prev.tokenExpiresAt !== rec.tokenExpiresAt
+    || prev.sessionExpiresAt !== rec.sessionExpiresAt || prev.userInfoJson !== rec.userInfoJson;
+  if (idx >= 0) store.codearts.accounts[idx] = Object.assign({}, prev, rec);
+  else store.codearts.accounts.push(rec);
+  store.codearts.current = store.codearts.accounts[idx >= 0 ? idx : store.codearts.accounts.length - 1];
+  if (changed) saveStore(store);
+  return a;
+}
+
+/** 列出 CodeArts 全部账号（供 /api/client/ca/accounts） */
+function caListAccounts() {
+  const store = loadStore();
+  const cur = store.codearts.current;
+  const curUid = cur ? String(cur.uid) : null;
+  const seen = new Set();
+  const list = [];
+  const push = (r) => {
+    if (!r || !r.uid || seen.has(String(r.uid))) return;
+    seen.add(String(r.uid));
+    list.push({
+      uid: String(r.uid),
+      nickname: r.nickname || String(r.uid),
+      phone: '',
+      tokenExpiresAt: r.tokenExpiresAt || null,
+      sessionExpiresAt: r.sessionExpiresAt || null,
+      checkin: null, // CodeArts 无签到
+    });
+  };
+  if (cur) push(cur);
+  for (const r of store.codearts.accounts) push(r);
+  list.sort((a, b) => (a.uid === curUid ? -1 : b.uid === curUid ? 1 : 0));
+  return { currentUid: curUid, accounts: list };
+}
+
+// ---------------- CodeArts 进程管理 ----------------
+
+function caIsIdeRunning() {
+  try {
+    const out = execFileSync('tasklist', ['/FI', 'IMAGENAME eq ' + CA_IDE_EXE, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true });
+    return out.includes(CA_IDE_EXE);
+  } catch (_) { return false; }
+}
+
+/** 停 CodeArts Agent：先优雅关闭（给 IDE 保存未保存编辑的机会），等不到再强杀；
+ *  最后清理 AgentKernel 内核进程（名字带版本号，需枚举后逐个杀）。 */
+async function caKillIde() {
+  try { execFileSync('taskkill', ['/IM', CA_IDE_EXE, '/T'], { stdio: 'ignore', windowsHide: true }); } catch (_) {}
+  for (let i = 0; i < 6; i++) {
+    if (!caIsIdeRunning()) break;
+    await sleep(1000);
+  }
+  if (caIsIdeRunning()) {
+    try { execFileSync('taskkill', ['/IM', CA_IDE_EXE, '/F', '/T'], { stdio: 'ignore', windowsHide: true }); } catch (_) {}
+  }
+  try {
+    const out = execFileSync('tasklist', ['/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true });
+    const kernels = new Set();
+    for (const line of String(out).split(/\r?\n/)) {
+      const m = line.match(/^"([^"]+\.exe)"/i);
+      if (m && /^AgentKernel_/i.test(m[1])) kernels.add(m[1]);
+    }
+    for (const k of kernels) {
+      try { execFileSync('taskkill', ['/IM', k, '/F', '/T'], { stdio: 'ignore', windowsHide: true }); } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+/** 定位 CodeArts Agent 可执行文件（切换后重启 / 启动设置用） */
+function caFindExe() {
+  return CA_EXE_CANDIDATES.find((p) => { try { return fs.existsSync(p); } catch (_) { return false; } }) || null;
+}
+
+function caLaunchIde() {
+  const exe = caFindExe();
+  if (!exe) return false;
+  try { spawn(exe, [], { detached: true, stdio: 'ignore', windowsHide: true }).unref(); return true; } catch (_) { return false; }
+}
+
+/**
+ * CodeArts Agent 一键切换账号：
+ * 停客户端（vscdb 被 IDE 持有，且防其退出时回写旧会话）→ 备份库密文写回 vscdb
+ * （本机备份原样写回；跨机导入的备份用明文以本机 key 重加密）→ 同步 .backup 副本
+ * 与内核侧 userInfo.json → 原来在运行则重启客户端。
+ */
+async function caSwitchToAccount(uid) {
+  const store = loadStore();
+  const rec = store.codearts.accounts.find((x) => x && String(x.uid) === String(uid));
+  if (!rec) throw new Error('账号备份不存在');
+  if (!rec.secretRaw && !rec.secretPlain) throw new Error('该备份缺少登录态数据');
+  if (!CA_VSCDB || !fs.existsSync(CA_VSCDB)) throw new Error('未找到 CodeArts Agent 数据目录（请先安装并登录一次）');
+  const wasRunning = caIsIdeRunning();
+  caSwitching = true;
+  try {
+    if (wasRunning || caIsIdeRunning()) {
+      log('[client:ca] 停止 CodeArts Agent 以写入登录态…');
+      await caKillIde();
+      for (let i = 0; i < 10 && caIsIdeRunning(); i++) await sleep(1000);
+      await sleep(800);
+    }
+    // 决定写入的密文：本机备份（能被本机 key 解开）原样写回，字节级一致最稳；
+    // 解不开（跨机导入）则用明文本机重加密。
+    let secretValue = rec.secretRaw || null;
+    const key = await caRequestKey();
+    if (secretValue) {
+      try { caDecryptVscSecret(secretValue, key); } catch (_) { secretValue = null; }
+    }
+    if (!secretValue) {
+      if (!rec.secretPlain) throw new Error('备份无可用登录态（既无本机密文也无明文）');
+      log('[client:ca] 备份来自其他电脑，用本机密钥重新加密会话');
+      secretValue = caEncryptVscSecret(rec.secretPlain, key);
+    }
+    // 写 vscdb（读一次真实 secret 键名，缺行则按默认键名插入）
+    const dbv = caReadDb() || {};
+    const secretKey = dbv.secretKey || CA_SECRET_KEY_DEFAULT;
+    let db = null;
+    try {
+      db = caOpenDb(CA_VSCDB, false);
+      db.exec('PRAGMA busy_timeout = 3000');
+      db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run(secretKey, secretValue);
+      if (rec.snapState) db.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run(CA_SNAP_KEY, rec.snapState);
+    } finally {
+      try { if (db) db.close(); } catch (_) {}
+    }
+    // VSCode 保有 state.vscdb.backup 兜底副本（打开异常时会回退到它），同步覆盖防止旧会话复活
+    try { fs.copyFileSync(CA_VSCDB, CA_VSCDB + '.backup'); } catch (_) {}
+    // 内核侧 userInfo.json 一并换回（若备份里带）
+    if (rec.userInfoJson) {
+      try {
+        fs.mkdirSync(path.dirname(CA_DOER_USERINFO), { recursive: true });
+        const tmp = CA_DOER_USERINFO + '.workpet-tmp';
+        fs.writeFileSync(tmp, rec.userInfoJson);
+        fs.renameSync(tmp, CA_DOER_USERINFO);
+      } catch (e) { log('[client:ca] 回写 userInfo.json 失败（不影响登录态）: ' + e.message); }
+    }
+    // 账号库：当前账号指向切换后的记录
+    const st2 = loadStore();
+    const idx = st2.codearts.accounts.findIndex((x) => x && String(x.uid) === String(uid));
+    if (idx >= 0) st2.codearts.current = st2.codearts.accounts[idx];
+    saveStore(st2);
+    log('[client:ca] 已切换账号 -> ' + (rec.nickname || uid));
+    let relaunched = false;
+    if (wasRunning) {
+      relaunched = caLaunchIde();
+      log('[client:ca] 切换前客户端在运行，已自动重启');
+    }
+    return { uid, nickname: rec.nickname || uid, relaunched };
+  } finally {
+    caSwitching = false;
+  }
+}
+
 const CLIENT_CHECKIN_CACHE_FILE = path.join(DATA_ROOT, 'client-checkin-cache.json');
 const clientCheckinState = {
   wb: { inFlight: false, running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0 },
   cb: { inFlight: false, running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0 },
   ac: { inFlight: false, running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0 },
+  ca: { inFlight: false, running: false, total: 0, done: 0, startedAt: 0, finishedAt: 0 },
 };
 // WB/CB 账号体系互通：同一账号在两端并发签到会被服务端以「请求处理中」拒绝，
 // 因此签到全局串行（一次只跑一个 profile 的签到轮）
@@ -1099,8 +1467,9 @@ function clientReadAuth(profileId) {
   return raw;
 }
 
-/** 把当前登录同步进账号库（登录文件变化时调用） */
+/** 把当前登录同步进账号库（登录文件变化时调用）；CodeArts 走异步解密，单独实现 */
 function clientSyncStore(profileId) {
+  if (profileId === 'ca') return; // ca 由 caSyncStore（异步）维护，不走 auth 文件路径
   const raw = clientReadAuth(profileId);
   if (!raw) return;
   const store = loadStore();
@@ -1131,8 +1500,9 @@ function clientSyncStore(profileId) {
   saveStore(store);
 }
 
-/** 列出客户端全部账号 + 当前登录（当前以 auth 文件为准） */
+/** 列出客户端全部账号 + 当前登录（当前以 auth 文件为准）；CodeArts 单独实现 */
 function clientListAccounts(profileId) {
+  if (profileId === 'ca') return caListAccounts();
   clientSyncStore(profileId);
   const store = loadStore();
   const sec = store[profileId === 'wb' ? 'workbuddy' : profileId === 'cb' ? 'codebuddy' : 'ac'];
@@ -1192,6 +1562,7 @@ function clientListAccounts(profileId) {
 }
 
 function clientTokenFor(profileId, uid) {
+  if (profileId === 'ca') return null; // CodeArts 无签到/积分，不需要取 token
   const raw = clientReadAuth(profileId);
   if (raw && String(raw.account.uid) === String(uid)) return raw.auth && raw.auth.accessToken;
   const store = loadStore();
@@ -1261,6 +1632,7 @@ async function acFetchCredits(accessToken) {
 }
 
 async function clientDailyCheckin(profileId, accessToken) {
+  if (profileId === 'ca') return { ok: false, message: 'CodeArts Agent 无签到（额度按官方政策自动发放）' };
   if (profileId === 'ac') return acDailyCheckin(accessToken);
   const profile = CLIENT_PROFILES[profileId];
   let lastErr = null;
@@ -1316,6 +1688,7 @@ async function clientDailyCheckin(profileId, accessToken) {
  * 只更新有效期元数据，绝不改写 accessToken，避免写坏登录态。
  */
 function clientSyncTokenExpiryAfterCheckin(profileId, uid, respBody) {
+  if (profileId === 'ca') return; // CodeArts 无签到，有效期由 caSyncStore 维护
   // 各种形态 → 毫秒时间戳（数字秒/毫秒、数字字符串、ISO 日期字符串）
   const asMs = (v) => {
     if (v == null) return null;
@@ -1401,6 +1774,7 @@ function clientSyncTokenExpiryAfterCheckin(profileId, uid, respBody) {
 }
 
 async function clientClaimDailyForAll(profileId) {
+  if (profileId === 'ca') return { skipped: true, reason: 'no-checkin' }; // CodeArts 无签到，不进入签到轮
   const st = clientCheckinState[profileId];
   if (st.inFlight || clientClaimGlobalLock) return { skipped: true, reason: 'in-flight' };
   // AutoClaw 首次读账号前确保 AES key 已就绪（异步，12s 硬超时；失败则本轮按无 key 处理）
@@ -1484,6 +1858,7 @@ function clientBuildResourceBody(now) {
 }
 
 async function clientFetchCredits(profileId, accessToken) {
+  if (profileId === 'ca') throw new Error('CodeArts Agent 额度按官方政策自动发放，无积分查询接口');
   if (profileId === 'ac') return acFetchCredits(accessToken);
   const profile = CLIENT_PROFILES[profileId];
   let lastErr = null;
@@ -1588,6 +1963,23 @@ for (const pid of ['wb', 'cb', 'ac']) {
 }
 // 启动即预热 AutoClaw AES key（后台异步，不阻塞；避免首次读账号时等解密）
 try { if (fs.existsSync(AC_AUTH_FILE)) acWarmKey(); } catch (_) {}
+
+// CodeArts Agent：启动即预热 key + 备份当前登录；之后监听 state.vscdb 变化
+// （客户端运行期间约每小时自动续期会话，续期后备份要跟着刷新，保证切换用的
+//   refresh_token 始终新鲜）。文件变化频繁但仅在内容真正变化时才落盘。
+try {
+  if (CA_VSCDB && fs.existsSync(CA_VSCDB)) {
+    caWarmKey();
+    caRequestKey()
+      .then(() => caSyncStore())
+      .then((a) => { if (a && a.uid) log('[client:ca] 已备份当前账号 ' + (a.nickname || a.uid)); })
+      .catch((e) => log('[client:ca] 启动备份失败: ' + e.message));
+    fs.watchFile(CA_VSCDB, { interval: 5000 }, (cur, prev) => {
+      if (!fs.existsSync(CA_VSCDB) || cur.mtimeMs === prev.mtimeMs || caSwitching) return;
+      caRequestKey().then(() => caSyncStore()).catch(() => {});
+    });
+  }
+} catch (_) {}
 
 
 async function rotateAllAccounts({ claim }) {
@@ -2059,6 +2451,12 @@ const server = http.createServer(async (req, res) => {
         clientClaimDailyForAll(pid).catch((e) => log('[client:' + pid + '] 自动签到失败: ' + e.message));
         // AutoClaw 先确保解密 key 就绪，否则首次列表拿不到当前账号（同步路径快速失败不阻塞）
         if (pid === 'ac') { try { await acRequestKey(); } catch (_) {} }
+        // CodeArts：登录态在 SQLite 且需解密，异步同步后返回（拉取同时即完成当前账号备份）
+        if (pid === 'ca') {
+          try { await caRequestKey(); await caSyncStore(); } catch (e) { log('[client:ca] 同步登录态失败: ' + e.message); }
+          const list2 = caListAccounts();
+          return sendJson(res, 200, { ok: true, ...list2, batch: clientCheckinState.ca });
+        }
         const list = clientListAccounts(pid);
         return sendJson(res, 200, { ok: true, ...list, batch: clientCheckinState[pid] });
       }
@@ -2070,6 +2468,7 @@ const server = http.createServer(async (req, res) => {
       if (!CLIENT_PROFILES[pid]) return sendJson(res, 404, { ok: false, error: 'unknown client' });
       const body = await readBody(req);
       if (parts[4] === 'credits') {
+        if (pid === 'ca') return sendJson(res, 400, { ok: false, error: 'CodeArts Agent 额度按官方政策自动发放，无积分查询接口' });
         const uid = (body.uid || '').trim();
         const tk = clientTokenFor(pid, uid);
         if (!tk) return sendJson(res, 404, { ok: false, error: '账号备份不存在或无 accessToken' });
@@ -2083,6 +2482,16 @@ const server = http.createServer(async (req, res) => {
       }
       if (parts[4] === 'switch') {
         const uid = (body.uid || '').trim();
+        // CodeArts：vscdb 写回 + 客户端重启，专用流程
+        if (pid === 'ca') {
+          try {
+            const r = await caSwitchToAccount(uid);
+            return sendJson(res, 200, { ok: true, uid, nickname: r.nickname, hint: r.relaunched ? '已切换并重启 CodeArts Agent' : '已切换；下次启动 CodeArts Agent 时生效' });
+          } catch (e) {
+            log('[client:ca] 切换失败: ' + e.message);
+            return sendJson(res, 500, { ok: false, error: e.message });
+          }
+        }
         const store = loadStore();
         const sec = store[pid === 'wb' ? 'workbuddy' : pid === 'cb' ? 'codebuddy' : 'ac'];
         if (pid === 'ac') {
@@ -2107,9 +2516,9 @@ const server = http.createServer(async (req, res) => {
       if (parts[4] === 'delete') {
         const uid = (body.uid || '').trim();
         const store = loadStore();
-        const sec = store[pid === 'wb' ? 'workbuddy' : pid === 'cb' ? 'codebuddy' : 'ac'];
+        const sec = pid === 'ca' ? store.codearts : store[pid === 'wb' ? 'workbuddy' : pid === 'cb' ? 'codebuddy' : 'ac'];
         const before = sec.accounts.length;
-        if (pid === 'ac') {
+        if (pid === 'ac' || pid === 'ca') {
           sec.accounts = sec.accounts.filter((a) => a && String(a.uid) !== String(uid));
         } else {
           sec.accounts = sec.accounts.filter((a) => a && a.account && String(a.account.uid) !== String(uid));
@@ -2191,7 +2600,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/config') {
       const s = loadSettings();
-      return sendJson(res, 200, { ok: true, launchHostOnStart: !!s.launchHostOnStart, wbLaunchOnStart: !!s.wbLaunchOnStart, showPhone: !!s.showPhone, fontScale: Number(s.fontScale ?? 1), cbLaunchOnStart: !!s.cbLaunchOnStart, acLaunchOnStart: !!s.acLaunchOnStart, hidePet: !!s.hidePet, tabShowText: !!s.tabShowText, tabOrder: normalizeTabOrder(s.tabOrder) || ['wb', 'cb', 'ac', 'tw'] });
+      return sendJson(res, 200, { ok: true, launchHostOnStart: !!s.launchHostOnStart, wbLaunchOnStart: !!s.wbLaunchOnStart, showPhone: !!s.showPhone, fontScale: Number(s.fontScale ?? 1), cbLaunchOnStart: !!s.cbLaunchOnStart, acLaunchOnStart: !!s.acLaunchOnStart, caLaunchOnStart: !!s.caLaunchOnStart, hidePet: !!s.hidePet, tabShowText: !!s.tabShowText, tabOrder: normalizeTabOrder(s.tabOrder) || ['wb', 'cb', 'ac', 'ca', 'tw'] });
     }
     if (req.method === 'POST' && url.pathname === '/api/config') {
       const body = await readBody(req);
@@ -2202,6 +2611,7 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.fontScale === 'number' && body.fontScale >= 0.8 && body.fontScale <= 1.5) patch.fontScale = body.fontScale;
       if (typeof body.cbLaunchOnStart === 'boolean') patch.cbLaunchOnStart = body.cbLaunchOnStart;
       if (typeof body.acLaunchOnStart === 'boolean') patch.acLaunchOnStart = body.acLaunchOnStart;
+      if (typeof body.caLaunchOnStart === 'boolean') patch.caLaunchOnStart = body.caLaunchOnStart;
       if (typeof body.hidePet === 'boolean') patch.hidePet = body.hidePet;
       if (typeof body.tabShowText === 'boolean') patch.tabShowText = body.tabShowText;
       if (Array.isArray(body.tabOrder)) {
@@ -2210,7 +2620,7 @@ const server = http.createServer(async (req, res) => {
       }
       const s = saveSettings(patch);
       log('[config] 已保存设置: ' + JSON.stringify(patch));
-      return sendJson(res, 200, { ok: true, launchHostOnStart: !!s.launchHostOnStart, wbLaunchOnStart: !!s.wbLaunchOnStart, showPhone: !!s.showPhone, fontScale: Number(s.fontScale ?? 1), cbLaunchOnStart: !!s.cbLaunchOnStart, acLaunchOnStart: !!s.acLaunchOnStart, hidePet: !!s.hidePet, tabShowText: !!s.tabShowText, tabOrder: normalizeTabOrder(s.tabOrder) || ['wb', 'cb', 'ac', 'tw'] });
+      return sendJson(res, 200, { ok: true, launchHostOnStart: !!s.launchHostOnStart, wbLaunchOnStart: !!s.wbLaunchOnStart, showPhone: !!s.showPhone, fontScale: Number(s.fontScale ?? 1), cbLaunchOnStart: !!s.cbLaunchOnStart, acLaunchOnStart: !!s.acLaunchOnStart, caLaunchOnStart: !!s.caLaunchOnStart, hidePet: !!s.hidePet, tabShowText: !!s.tabShowText, tabOrder: normalizeTabOrder(s.tabOrder) || ['wb', 'cb', 'ac', 'ca', 'tw'] });
     }
     if (req.method === 'GET' && url.pathname === '/api/check-update') {
       try {
@@ -2525,6 +2935,18 @@ async function main() {
       else log('[proc] 未找到 AutoClaw.exe，跳过拉起');
     } catch (e) {
       log('[proc] 拉起 AutoClaw 异常: ' + e.message);
+    }
+  }
+
+  // 设置项：打开 Pet 时同时启动 CodeArts Agent（默认关闭）
+  if (settings.caLaunchOnStart) {
+    log('[proc] 设置项开启：启动时拉起 CodeArts Agent');
+    try {
+      if (caIsIdeRunning()) log('[proc] CodeArts Agent 已在运行，跳过拉起');
+      else if (caLaunchIde()) log('[proc] 已拉起 CodeArts Agent');
+      else log('[proc] 未找到 codearts-agent.exe，跳过拉起');
+    } catch (e) {
+      log('[proc] 拉起 CodeArts Agent 异常: ' + e.message);
     }
   }
 
